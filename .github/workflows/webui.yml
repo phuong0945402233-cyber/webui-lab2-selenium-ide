@@ -32,6 +32,8 @@ jobs:
           import time
           import uuid
           from pathlib import Path
+          import win32api
+          import win32con
           
           from PIL import ImageGrab
           from pywinauto import Desktop
@@ -64,6 +66,23 @@ jobs:
           opts.set_preference('datareporting.policy.dataSubmissionEnabled', False)
           driver = None
           ide = None
+          
+          
+          def prepare_display():
+              modes = []
+              for index in range(500):
+                  try:
+                      mode = win32api.EnumDisplaySettings(None, index)
+                  except Exception:
+                      break
+                  if mode.PelsWidth >= 1440 and mode.PelsHeight >= 900 and mode.PelsWidth <= 1920:
+                      modes.append(mode)
+              if modes:
+                  mode = min(modes, key=lambda m: (abs(m.PelsWidth-1600)+abs(m.PelsHeight-1000), -m.BitsPerPel))
+                  win32api.ChangeDisplaySettings(mode, 0)
+              width, height = win32api.GetSystemMetrics(0), win32api.GetSystemMetrics(1)
+              print('Desktop dimensions:', width, height, flush=True)
+              return min(1320, width), min(930, height-40)
           
           
           def visible(css, seconds=40):
@@ -113,14 +132,19 @@ jobs:
               root.set_focus()
               extensions = root.child_window(title_re=r'^Extensions(?: \(.*\))?$', control_type='Button')
               extensions.wait('visible', timeout=20)
-              extensions.click_input()
-              menu = root.child_window(title_re=r'^Selenium IDE(?:\s.*)?$', control_type='Button')
+              extensions.invoke()
+              ImageGrab.grab().save(OUT / 'extensions-open.png')
+              (OUT / 'extensions-controls.json').write_text(json.dumps([
+                  {'name': e.window_text(), 'type': e.element_info.control_type}
+                  for e in root.descendants() if e.is_visible()
+              ], ensure_ascii=False, indent=2), encoding='utf-8')
+              menu = root.child_window(title_re=r'^Selenium IDE\b', control_type='Button')
               menu.wait('visible', timeout=20)
-              menu.click_input()
+              menu.invoke()
               handle = WebDriverWait(driver, 30).until(lambda d: next((h for h in d.window_handles if h not in handles), None))
               driver.switch_to.window(handle)
               WebDriverWait(driver, 30).until(lambda d: d.title.startswith('Selenium IDE'))
-              driver.set_window_rect(0, 0, 1320, 930)
+              driver.set_window_rect(0, 0, *window_size)
               return handle
           
           
@@ -238,8 +262,9 @@ jobs:
           
           
           try:
+              window_size = prepare_display()
               driver = webdriver.Firefox(options=opts)
-              driver.set_window_rect(0, 0, 1320, 930)
+              driver.set_window_rect(0, 0, *window_size)
               installed = driver.install_addon(os.environ['SELENIUM_IDE_XPI'], temporary=False)
               assert installed == '{a6fd85ed-e919-4a43-a5af-8da18bda539f}'
               ide = launch_ide()
