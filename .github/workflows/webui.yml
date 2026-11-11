@@ -34,6 +34,372 @@ jobs:
           from pathlib import Path
           import win32api
           import win32con
+          import win32gui
+          
+          from PIL import ImageGrab
+          from pywinauto import Desktop
+          from selenium import webdriver
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support import expected_conditions as EC
+          from selenium.webdriver.support.ui import WebDriverWait
+          
+          BASE = 'https://www.saucedemo.com'
+          OUT = Path('out').resolve()
+          OUT.mkdir(exist_ok=True)
+          PROJECT = os.environ['WEBUI_PROJECT_NAME']
+          CASES = ['TC01 Valid login', 'TC02 Incorrect password',
+                   'TC03 Authenticated cart', 'TC04 Unauthenticated cart',
+                   'TC05 Complete checkout information', 'TC06 Missing postal code']
+          CHECKS = [
+              [('css=[data-test="title"]', 'Products')],
+              [('css=[data-test="error"]', 'Epic sadface: Username and password do not match any user in this service')],
+              [('css=[data-test="title"]', 'Your Cart'), ('css=[data-test="inventory-item-name"]', 'Sauce Labs Backpack'), ('css=[data-test="item-quantity"]', '1')],
+              [('css=[data-test="error"]', "Epic sadface: You can only access '/cart.html' when you are logged in.")],
+              [('css=[data-test="title"]', 'Checkout: Overview'), ('css=[data-test="inventory-item-name"]', 'Sauce Labs Backpack')],
+              [('css=[data-test="error"]', 'Error: Postal Code is required')]
+          ]
+          
+          opts = webdriver.FirefoxOptions()
+          opts.set_preference('browser.shell.checkDefaultBrowser', False)
+          opts.set_preference('signon.rememberSignons', False)
+          opts.set_preference('browser.download.panel.shown', True)
+          opts.set_preference('datareporting.healthreport.uploadEnabled', False)
+          opts.set_preference('datareporting.policy.dataSubmissionEnabled', False)
+          driver = None
+          ide = None
+          ide_window = None
+          control_handle = None
+          
+          
+          def prepare_display():
+              modes = []
+              for index in range(500):
+                  try:
+                      mode = win32api.EnumDisplaySettings(None, index)
+                  except Exception:
+                      break
+                  if mode.PelsWidth >= 1440 and mode.PelsHeight >= 900 and mode.PelsWidth <= 1920:
+                      modes.append(mode)
+              if modes:
+                  mode = min(modes, key=lambda m: (abs(m.PelsWidth-1600)+abs(m.PelsHeight-1000), -m.BitsPerPel))
+                  win32api.ChangeDisplaySettings(mode, 0)
+              width, height = win32api.GetSystemMetrics(0), win32api.GetSystemMetrics(1)
+              print('Desktop dimensions:', width, height, flush=True)
+              return min(1320, width), min(930, height-40)
+          
+          
+          def visible(css, seconds=40):
+              return WebDriverWait(driver, seconds).until(EC.visibility_of_element_located((By.CSS_SELECTOR, css)))
+          
+          
+          def click(css):
+              WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.CSS_SELECTOR, css))).click()
+          
+          
+          def text_input(css, value):
+              e = visible(css)
+              e.clear()
+              e.send_keys(value)
+          
+          
+          def ui_find(name, kind=None, contains=False, seconds=35):
+              def find(_):
+                  try:
+                      matches = [e for e in ide_window.descendants() if e.is_visible() and e.is_enabled()
+                                 and (kind is None or e.element_info.control_type == kind)
+                                 and (name in e.window_text() if contains else name == e.window_text())]
+                      rank = {'Button': 0, 'Hyperlink': 1, 'Edit': 2, 'ListItem': 3, 'Text': 4}
+                      matches.sort(key=lambda e: rank.get(e.element_info.control_type, 9), reverse=True)
+                      return matches[-1] if matches else False
+                  except Exception:
+                      return False
+              return WebDriverWait(driver, seconds, poll_frequency=.4).until(find)
+          
+          
+          def ui_click(name, kind=None, contains=False):
+              e = ui_find(name, kind=kind, contains=contains)
+              try:
+                  e.invoke()
+              except (AttributeError, NotImplementedError):
+                  e.click_input()
+          
+          
+          def dump_ui(name):
+              if ide_window is None:
+                  return
+              rows = []
+              for e in ide_window.descendants():
+                  try:
+                      r = e.rectangle()
+                      rows.append({'name': e.window_text(), 'type': e.element_info.control_type,
+                                   'visible': e.is_visible(), 'rect': [r.left, r.top, r.right, r.bottom]})
+                  except Exception:
+                      pass
+              (OUT / (name + '.json')).write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          
+          
+          def dialog_value(value, submit='OK'):
+              def edit(_):
+                  edits = [e for e in ide_window.descendants(control_type='Edit') if e.is_visible() and e.is_enabled()]
+                  return edits[-1] if edits else False
+              e = WebDriverWait(driver, 30).until(edit)
+              e.set_edit_text(value)
+              ui_click(submit, 'Button')
+          
+          
+          def reset_demo():
+              for handle in list(driver.window_handles):
+                  if handle not in (ide, control_handle):
+                      driver.switch_to.window(handle)
+                      driver.close()
+              driver.switch_to.window(control_handle)
+              driver.get(BASE + '/')
+              driver.delete_all_cookies()
+              driver.execute_script('localStorage.clear(); sessionStorage.clear();')
+              driver.get(BASE + '/')
+          
+          
+          def launch_ide():
+              driver.get(BASE + '/')
+              visible('#login-button')
+              print('Live SauceDemo login page connected.', flush=True)
+              handles = set(driver.window_handles)
+              root = Desktop(backend='uia').window(process=driver.capabilities['moz:processID'], title_re=r'.*Swag Labs.*Firefox.*')
+              root.wait('visible', timeout=30)
+              root.set_focus()
+              extensions = root.child_window(title_re=r'^Extensions(?: \(.*\))?$', control_type='Button')
+              extensions.wait('visible', timeout=20)
+              extensions.invoke()
+              ImageGrab.grab().save(OUT / 'extensions-open.png')
+              (OUT / 'extensions-controls.json').write_text(json.dumps([
+                  {'name': e.window_text(), 'type': e.element_info.control_type}
+                  for e in root.descendants() if e.is_visible()
+              ], ensure_ascii=False, indent=2), encoding='utf-8')
+              menu = root.child_window(title_re=r'^Selenium IDE\b', control_type='Button')
+              menu.wait('visible', timeout=20)
+              menu.invoke()
+              handle = WebDriverWait(driver, 30).until(lambda d: next((h for h in d.window_handles if h not in handles), None))
+              global ide_window
+              ide_window = Desktop(backend='uia').window(title_re=r'.*Selenium IDE.*Firefox.*').wrapper_object()
+              win32gui.MoveWindow(ide_window.handle, 0, 0, *window_size, True)
+              ui_find('Create a new project', seconds=50)
+              dump_ui('ide-welcome-controls')
+              return handle
+          
+          
+          def login(password='secret_sauce'):
+              text_input('#user-name', 'standard_user')
+              text_input('#password', password)
+              click('#login-button')
+          
+          
+          def live_case(index):
+              if index == 3:
+                  driver.get(BASE + '/cart.html')
+              else:
+                  login('wrong_sauce' if index == 1 else 'secret_sauce')
+                  if index not in (0, 1):
+                      visible('#add-to-cart-sauce-labs-backpack')
+                      click('#add-to-cart-sauce-labs-backpack')
+                      click('[data-test="shopping-cart-link"]')
+                      if index in (4, 5):
+                          click('#checkout')
+                          text_input('#first-name', 'Test')
+                          text_input('#last-name', 'Buyer')
+                          if index == 4:
+                              text_input('#postal-code', '100000')
+                          click('#continue')
+              for target, expected in CHECKS[index]:
+                  css = target.removeprefix('css=')
+                  WebDriverWait(driver, 30).until(lambda d: visible(css, 5).text == expected)
+          
+          
+          def recording_window():
+              for handle in driver.window_handles:
+                  if handle in (ide, control_handle):
+                      continue
+                  driver.switch_to.window(handle)
+                  if driver.current_url.startswith(BASE):
+                      return handle
+              return None
+          
+          
+          def record(index):
+              reset_demo()
+              if index:
+                  ui_click('Add new test', 'Button')
+                  dialog_value(CASES[index])
+              ui_click('Start recording', 'Button')
+              if index == 0:
+                  dialog_value(BASE + '/', 'Start recording')
+              WebDriverWait(driver, 30).until(lambda d: recording_window())
+              visible('#login-button')
+              live_case(index)
+              ui_click('Stop recording', 'Button')
+              if index == 0:
+                  dialog_value(CASES[index])
+              dump_ui('recorded-%02d-controls' % (index+1))
+              print('Recorded scenario', index + 1, flush=True)
+          
+          
+          def save_recording():
+              ui_click('Save project', contains=True)
+              dialog = Desktop(backend='win32').window(class_name='#32770', title='Save As')
+              dialog.wait('visible', timeout=25)
+              dialog.child_window(control_id=1001, class_name='Edit').set_edit_text(str(OUT / 'recorded.side'))
+              dialog.child_window(control_id=1, class_name='Button').click_input()
+              WebDriverWait(driver, 20).until(lambda d: (OUT / 'recorded.side').exists())
+          
+          
+          def command(name, target='', value=''):
+              return {'id': str(uuid.uuid4()), 'comment': '', 'command': name, 'target': target, 'targets': [], 'value': value}
+          
+          
+          def add_checks():
+              project = json.loads((OUT / 'recorded.side').read_text(encoding='utf-8-sig'))
+              assert project['name'] == PROJECT
+              assert set(x['name'] for x in project['tests']) == set(CASES)
+              project['tests'] = [next(x for x in project['tests'] if x['name'] == name) for name in CASES]
+              for i, test in enumerate(project['tests']):
+                  original = test['commands']
+                  if i != 3:
+                      assert any(c['command'] == 'type' and c['value'] == 'standard_user' for c in original), 'Recorder did not capture login'
+                      assert any(c['command'] == 'click' for c in original), 'Recorder did not capture clicks'
+                  if i == 3:
+                      test['commands'] = [command('open', '/cart.html')]
+                  for target, expected in CHECKS[i]:
+                      test['commands'].append(command('waitForElementVisible', target, '30000'))
+                      test['commands'].append(command('assertText', target, expected))
+              (OUT / 'replay.side').write_text(json.dumps(project, ensure_ascii=False, indent=2), encoding='utf-8')
+              return project
+          
+          
+          def open_project(path):
+              ui_click('Open project', contains=True)
+              dialog = Desktop(backend='win32').window(class_name='#32770', title='Open')
+              dialog.wait('visible', timeout=25)
+              dialog.child_window(control_id=1001, class_name='Edit').set_edit_text(str(path))
+              dialog.child_window(control_id=1, class_name='Button').click_input()
+              ui_find(PROJECT, contains=True)
+          
+          
+          def play(index):
+              reset_demo()
+              ui_click(CASES[index])
+              ui_click('Run current test', contains=True)
+              success = "'" + CASES[index] + "' completed successfully"
+              ui_find(success, contains=True, seconds=90)
+              name_element = ui_find(PROJECT)
+              win32gui.SetWindowPos(ide_window.handle, win32con.HWND_TOP, 0, 0, *window_size, win32con.SWP_SHOWWINDOW)
+              ide_window.set_focus()
+              window_rect, name_rect = ide_window.rectangle(), name_element.rectangle()
+              filename = 'ide-%02d.png' % (index + 1)
+              ImageGrab.grab(bbox=(window_rect.left, window_rect.top, window_rect.right, window_rect.bottom)).save(OUT / filename)
+              dump_ui('played-%02d-controls' % (index+1))
+              print('Selenium IDE playback passed:', CASES[index], flush=True)
+              return {'case': CASES[index], 'status': 'passed', 'assertions': len(CHECKS[index]),
+                      'screenshot': filename, 'project_rect': {'x':name_rect.left-window_rect.left, 'y':name_rect.top-window_rect.top,
+                      'width':name_rect.width(), 'height':name_rect.height()},
+                      'viewport': [window_rect.width(), window_rect.height()]}
+          
+          
+          try:
+              window_size = prepare_display()
+              driver = webdriver.Firefox(options=opts)
+              control_handle = driver.current_window_handle
+              driver.set_window_rect(0, 0, *window_size)
+              installed = driver.install_addon(os.environ['SELENIUM_IDE_XPI'], temporary=False)
+              assert installed == '{a6fd85ed-e919-4a43-a5af-8da18bda539f}'
+              ide = launch_ide()
+              ui_click('Create a new project')
+              dialog_value(PROJECT)
+              dump_ui('project-created-controls')
+              for index in range(6):
+                  record(index)
+              save_recording()
+              add_checks()
+              open_project(OUT / 'replay.side')
+              results = [play(index) for index in range(6)]
+              (OUT / 'results.json').write_text(json.dumps({'origin': BASE, 'project': PROJECT,
+                  'browser': driver.capabilities['browserVersion'], 'addon': '3.17.4',
+                  'executed_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  'cases': results}, ensure_ascii=False, indent=2), encoding='utf-8')
+          except Exception:
+              ImageGrab.grab().save(OUT / 'diagnostic-desktop.png')
+              try:
+                  dump_ui('diagnostic-ide-controls')
+              except Exception:
+                  pass
+              if driver is not None:
+                  try:
+                      (OUT / 'diagnostic-dom.html').write_text(driver.page_source, encoding='utf-8')
+                  except Exception:
+                      pass
+              raise
+          finally:
+              if driver is not None:
+                  driver.quit()
+      - name: Encrypt original screenshots and results
+        if: always()
+        env:
+          EVIDENCE_KEY: ${{ secrets.EVIDENCE_KEY }}
+        shell: python
+        run: |
+          import io, os, zipfile
+          from pathlib import Path
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          key = bytes.fromhex(os.environ['EVIDENCE_KEY'])
+          assert len(key) == 32
+          data = io.BytesIO()
+          with zipfile.ZipFile(data, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in Path('out').rglob('*'):
+                  if path.is_file():
+                      archive.write(path, path.relative_to('out'))
+          nonce = os.urandom(12)
+          Path('evidence.aesgcm').write_bytes(nonce + AESGCM(key).encrypt(nonce, data.getvalue(), b'webui-lab2'))
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: encrypted-selenium-ide-evidence
+          path: evidence.aesgcm
+          if-no-files-found: error
+          retention-days: 7
+name: Web UI lab
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  selenium-ide:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install official Selenium IDE and test dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          $addon = Join-Path $env:RUNNER_TEMP 'selenium-ide.xpi'
+          Invoke-WebRequest 'https://addons.mozilla.org/firefox/downloads/file/3896650/selenium_ide-3.17.4.xpi' -OutFile $addon
+          if ((Get-FileHash $addon -Algorithm SHA256).Hash.ToLower() -ne '6daa2585bd9d844c3dba66b59925bbadf17e61e3c3304021d949c4007b5b80af') { throw 'Official add-on hash mismatch' }
+          "SELENIUM_IDE_XPI=$addon" >> $env:GITHUB_ENV
+          python -m pip install selenium==4.41.0 pywinauto==0.6.9 Pillow==11.3.0 cryptography
+      - name: Record and replay six cases in real Selenium IDE
+        env:
+          WEBUI_PROJECT_NAME: ${{ secrets.WEBUI_PROJECT_NAME }}
+          PYTHONUTF8: '1'
+        shell: python
+        run: |
+          import io
+          import json
+          import os
+          import time
+          import uuid
+          from pathlib import Path
+          import win32api
+          import win32con
           
           from PIL import ImageGrab
           from pywinauto import Desktop
